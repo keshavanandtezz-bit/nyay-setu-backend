@@ -10,9 +10,18 @@ import tempfile
 load_dotenv()
 
 router = APIRouter(prefix="/ai", tags=["ai"])
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
+GROQ_KEY = os.getenv("GROQ_API_KEY", "")
 MODEL = "llama-3.3-70b-versatile"
+
+
+def get_groq_client():
+    if not GROQ_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="GROQ_API_KEY not set in environment variables"
+        )
+    return Groq(api_key=GROQ_KEY)
 
 
 class ChatMessage(BaseModel):
@@ -35,34 +44,58 @@ class BailRequest(BaseModel):
     lawyer: str
 
 
+@router.get("/check-key")
+async def check_key():
+    """Check if Groq key is configured correctly"""
+    if not GROQ_KEY:
+        return {"status": "error", "message": "GROQ_API_KEY not set"}
+    if len(GROQ_KEY) < 20:
+        return {"status": "error", "message": "GROQ_API_KEY looks invalid (too short)"}
+    return {
+        "status": "ok",
+        "key_prefix": GROQ_KEY[:8] + "...",
+        "key_length": len(GROQ_KEY)
+    }
+
+
 @router.post("/rights-bot")
 async def rights_bot(payload: ChatMessage):
-    """AI chatbot for legal rights questions"""
     try:
-        system = payload.system_prompt or """You are Nyay Sahayak, a compassionate legal rights
-assistant for Indian citizens. Explain Indian laws and rights in simple plain English.
-Never give specific legal advice — always suggest consulting a lawyer.
-Keep answers under 200 words. Use bullet points for lists.
-When relevant, mention free legal aid helpline: 15100.
-Focus on: IPC, CrPC, bail rights, undertrial rights, FIR procedures, legal aid, NDPS, domestic violence."""
+        client = get_groq_client()
 
-        response = groq_client.chat.completions.create(
+        system = payload.system_prompt or (
+            "You are Nyay Sahayak, a legal rights assistant for Indian citizens. "
+            "Explain Indian laws and rights in simple plain English. "
+            "Never give specific legal advice — always suggest consulting a lawyer. "
+            "Keep answers under 200 words. Use bullet points for lists. "
+            "When relevant mention free legal aid helpline: 15100. "
+            "Focus on: IPC, CrPC, bail rights, undertrial rights, FIR procedures."
+        )
+
+        messages = [{"role": "system", "content": system}]
+        for m in payload.messages:
+            if isinstance(m, dict):
+                messages.append(m)
+
+        response = client.chat.completions.create(
             model=MODEL,
-            messages=[{"role": "system", "content": system}] + payload.messages,
+            messages=messages,
             max_tokens=500,
             temperature=0.7
         )
-        return {"reply": response.choices[0].message.content}
+        reply = response.choices[0].message.content
+        return {"reply": reply}
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        error_msg = str(e)
+        print(f"RightsBot error: {error_msg}")
+        raise HTTPException(status_code=500, detail=error_msg)
 
 
 @router.post("/analyze-case")
 async def analyze_case(file: UploadFile = File(...)):
-    """Extract text from PDF and analyze case with AI"""
     if not file.filename.endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are accepted")
+        raise HTTPException(status_code=400, detail="Only PDF files accepted")
 
     try:
         content = await file.read()
@@ -78,13 +111,14 @@ async def analyze_case(file: UploadFile = File(...)):
                     full_text += text + "\n"
 
         if not full_text.strip():
-            raise HTTPException(status_code=400,
-                detail="PDF appears to be scanned. Please use a searchable PDF.")
+            raise HTTPException(
+                status_code=400,
+                detail="PDF appears scanned. Please use a searchable PDF."
+            )
 
         words = full_text.split()[:3500]
         truncated = " ".join(words)
-
-        result = await _analyze_text(truncated)
+        result = await _analyze_text_internal(truncated)
         return {"success": True, "analysis": result}
 
     except HTTPException:
@@ -95,15 +129,13 @@ async def analyze_case(file: UploadFile = File(...)):
 
 @router.post("/analyze-text")
 async def analyze_text_endpoint(payload: dict):
-    """Analyze raw case text (for sample case demo)"""
     try:
         text = payload.get("text", "")
         if not text:
             raise HTTPException(status_code=400, detail="No text provided")
-
         words = text.split()[:3500]
         truncated = " ".join(words)
-        result = await _analyze_text(truncated)
+        result = await _analyze_text_internal(truncated)
         return {"success": True, "analysis": result}
     except HTTPException:
         raise
@@ -111,35 +143,29 @@ async def analyze_text_endpoint(payload: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-async def _analyze_text(case_text: str) -> dict:
-    response = groq_client.chat.completions.create(
+async def _analyze_text_internal(case_text: str) -> dict:
+    client = get_groq_client()
+    response = client.chat.completions.create(
         model=MODEL,
         max_tokens=1500,
         messages=[
             {
                 "role": "system",
-                "content": """You are Nyay Mitra, an AI legal assistant for Indian courts.
-Analyze the case document and return ONLY valid JSON with no extra text, no markdown, no backticks.
-Use this exact structure:
-{
-  "case_title": "Short title like State vs. Accused Name",
-  "case_number": "Full case number",
-  "court": "Name of court",
-  "judge": "Judge name or Unknown",
-  "accused": ["Name 1", "Name 2"],
-  "charges": ["Charge 1", "Charge 2"],
-  "ipc_sections": ["IPC 420", "IPC 406"],
-  "bail_status": "Denied / Granted / Not Applied",
-  "current_status": "Current stage of trial",
-  "key_facts": ["Fact 1", "Fact 2", "Fact 3", "Fact 4", "Fact 5"],
-  "important_dates": [{"event": "FIR Filed", "date": "DD.MM.YYYY"}],
-  "summary": "3 sentence plain English summary for a judge preparing for hearing.",
-  "next_hearing": "DD.MM.YYYY or Unknown",
-  "witnesses_total": 0,
-  "witnesses_examined": 0
-}"""
+                "content": (
+                    "You are Nyay Mitra, an AI legal assistant for Indian courts. "
+                    "Analyze the case document and return ONLY valid JSON. "
+                    "No extra text, no markdown, no backticks. "
+                    'Use this exact structure: {"case_title":"","case_number":"",'
+                    '"court":"","judge":"","accused":[],"charges":[],'
+                    '"ipc_sections":[],"bail_status":"","current_status":"",'
+                    '"key_facts":[],"important_dates":[],"summary":"",'
+                    '"next_hearing":"","witnesses_total":0,"witnesses_examined":0}'
+                )
             },
-            {"role": "user", "content": f"Analyze this Indian court document:\n\n{case_text}"}
+            {
+                "role": "user",
+                "content": f"Analyze this Indian court document:\n\n{case_text}"
+            }
         ]
     )
     raw = response.choices[0].message.content
@@ -149,50 +175,51 @@ Use this exact structure:
 
 @router.post("/generate-bail")
 async def generate_bail_application(payload: BailRequest):
-    """Generate a complete bail application document"""
     try:
+        client = get_groq_client()
         from datetime import date
         today = date.today().strftime("%d %B %Y")
 
-        response = groq_client.chat.completions.create(
+        response = client.chat.completions.create(
             model=MODEL,
             max_tokens=1500,
             messages=[
                 {
                     "role": "system",
-                    "content": """You are an expert Indian criminal lawyer. Generate a formal,
-professional bail application for an Indian court. Use proper legal language, formatting, and
-structure. Include all standard sections of an Indian bail application under CrPC Section 437
-or 439. Return only the bail application text, properly formatted."""
+                    "content": (
+                        "You are an expert Indian criminal lawyer. "
+                        "Generate formal professional bail applications "
+                        "for Indian courts under CrPC Section 437 or 439. "
+                        "Return only the bail application text, properly formatted."
+                    )
                 },
                 {
                     "role": "user",
-                    "content": f"""Generate a complete formal bail application:
-
-Name: {payload.prisoner_name}
-Age: {payload.age} years
-Prisoner ID: {payload.prisoner_id}
-Charges: {payload.charges}
-IPC Sections: {payload.ipc_sections}
-Court: {payload.court}
-District: {payload.district}
-Date of Arrest: {payload.arrest_date}
-Days in Custody: {payload.days_in_custody} days
-Prior Criminal Record: {'Yes' if payload.has_prior_record else 'No'}
-Current Status: {payload.case_status}
-Legal Representation: {payload.lawyer}
-Today's Date: {today}
-
-Generate a complete bail application with: court header, application number placeholder,
-grounds for bail (emphasizing {payload.days_in_custody} days of custody, personal liberty
-under Article 21, no flight risk), prayer clause, and verification."""
+                    "content": (
+                        f"Generate a complete formal bail application:\n\n"
+                        f"Name: {payload.prisoner_name}\n"
+                        f"Age: {payload.age} years\n"
+                        f"Prisoner ID: {payload.prisoner_id}\n"
+                        f"Charges: {payload.charges}\n"
+                        f"IPC Sections: {payload.ipc_sections}\n"
+                        f"Court: {payload.court}\n"
+                        f"District: {payload.district}\n"
+                        f"Date of Arrest: {payload.arrest_date}\n"
+                        f"Days in Custody: {payload.days_in_custody} days\n"
+                        f"Prior Criminal Record: {'Yes' if payload.has_prior_record else 'No'}\n"
+                        f"Current Status: {payload.case_status}\n"
+                        f"Legal Representation: {payload.lawyer}\n"
+                        f"Today's Date: {today}\n\n"
+                        f"Write a complete bail application with court header, "
+                        f"grounds for bail emphasizing {payload.days_in_custody} days "
+                        f"in custody, Article 21 rights, prayer clause, and verification."
+                    )
                 }
             ]
         )
-        return {
-            "success": True,
-            "application": response.choices[0].message.content
-        }
+        return {"success": True, "application": response.choices[0].message.content}
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        error_msg = str(e)
+        print(f"Bail generation error: {error_msg}")
+        raise HTTPException(status_code=500, detail=error_msg)
