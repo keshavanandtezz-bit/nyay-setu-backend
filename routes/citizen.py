@@ -1,6 +1,9 @@
+"""
+Citizen API routes — reads from MongoDB Atlas.
+"""
 from fastapi import APIRouter
 from datetime import date
-from db.supabase_client import supabase
+from db.mongo_client import undertrials_col, hearings_col
 
 router = APIRouter(prefix="/citizen", tags=["citizen"])
 
@@ -21,53 +24,43 @@ def get_alert_status(days: int) -> str:
     return "green"
 
 
+def clean(doc: dict) -> dict:
+    """Remove MongoDB _id field so it's JSON serializable."""
+    doc.pop("_id", None)
+    return doc
+
+
 @router.get("/status/search")
 async def search_prisoner(q: str = ""):
     if not q.strip():
         return {"found": False, "results": [], "count": 0}
 
     try:
-        id_result = supabase.table("undertrials") \
-            .select("*") \
-            .ilike("prisoner_id", f"%{q}%") \
-            .execute()
+        q_lower = q.lower()
+        # Search by prisoner_id OR name (case-insensitive)
+        results = list(undertrials_col.find({
+            "$or": [
+                {"prisoner_id": {"$regex": q_lower, "$options": "i"}},
+                {"name": {"$regex": q_lower, "$options": "i"}}
+            ]
+        }))
 
-        name_result = supabase.table("undertrials") \
-            .select("*") \
-            .ilike("name", f"%{q}%") \
-            .execute()
-
-        all_records = list(id_result.data or [])
-        seen_ids = {r["prisoner_id"] for r in all_records}
-        for r in (name_result.data or []):
-            if r["prisoner_id"] not in seen_ids:
-                all_records.append(r)
-                seen_ids.add(r["prisoner_id"])
-
-        if not all_records:
+        if not results:
             return {"found": False, "results": [], "count": 0}
 
         enriched = []
-        for p in all_records:
+        for p in results:
+            p = clean(p)
             days = days_in_custody(p["arrest_date"])
-            hearings_result = supabase.table("hearings") \
-                .select("*") \
-                .eq("prisoner_id", p["prisoner_id"]) \
-                .order("hearing_date") \
-                .execute()
-
+            hearings = [clean(h) for h in hearings_col.find({"prisoner_id": p["prisoner_id"]}).sort("hearing_date", 1)]
             enriched.append({
                 **p,
                 "days_in_custody": days,
                 "alert_status": get_alert_status(days),
-                "hearings": hearings_result.data or []
+                "hearings": hearings
             })
 
-        return {
-            "found": True,
-            "count": len(enriched),
-            "results": enriched
-        }
+        return {"found": True, "count": len(enriched), "results": enriched}
 
     except Exception as e:
         print(f"Search error: {e}")
@@ -77,22 +70,13 @@ async def search_prisoner(q: str = ""):
 @router.get("/status/{prisoner_id}")
 async def get_prisoner_status(prisoner_id: str):
     try:
-        result = supabase.table("undertrials") \
-            .select("*") \
-            .eq("prisoner_id", prisoner_id) \
-            .execute()
-
-        if not result.data:
+        p = undertrials_col.find_one({"prisoner_id": prisoner_id})
+        if not p:
             return {"found": False}
 
-        p = result.data[0]
+        p = clean(p)
         days = days_in_custody(p["arrest_date"])
-
-        hearings_result = supabase.table("hearings") \
-            .select("*") \
-            .eq("prisoner_id", prisoner_id) \
-            .order("hearing_date") \
-            .execute()
+        hearings = [clean(h) for h in hearings_col.find({"prisoner_id": prisoner_id}).sort("hearing_date", 1)]
 
         return {
             "found": True,
@@ -100,10 +84,9 @@ async def get_prisoner_status(prisoner_id: str):
                 **p,
                 "days_in_custody": days,
                 "alert_status": get_alert_status(days),
-                "hearings": hearings_result.data or []
+                "hearings": hearings
             }
         }
-
     except Exception as e:
         print(f"Get prisoner error: {e}")
         return {"found": False, "error": str(e)}
@@ -112,24 +95,15 @@ async def get_prisoner_status(prisoner_id: str):
 @router.get("/calendar/{prisoner_id}")
 async def get_court_calendar(prisoner_id: str):
     try:
-        p_result = supabase.table("undertrials") \
-            .select("*") \
-            .eq("prisoner_id", prisoner_id) \
-            .execute()
-
-        if not p_result.data:
+        p = undertrials_col.find_one({"prisoner_id": prisoner_id})
+        if not p:
             return {"found": False}
 
-        p = p_result.data[0]
+        p = clean(p)
         days = days_in_custody(p["arrest_date"])
+        hearings = [clean(h) for h in hearings_col.find({"prisoner_id": prisoner_id}).sort("hearing_date", 1)]
 
-        hearings_result = supabase.table("hearings") \
-            .select("*") \
-            .eq("prisoner_id", prisoner_id) \
-            .order("hearing_date") \
-            .execute()
-
-        next_hearing_str = str(p["next_hearing"]) if p.get("next_hearing") else None
+        next_hearing_str = p.get("next_hearing")
         days_until = 0
         if next_hearing_str:
             try:
@@ -149,10 +123,9 @@ async def get_court_calendar(prisoner_id: str):
                 "next_hearing_date": next_hearing_str,
                 "days_until_hearing": days_until,
                 "days_in_custody": days,
-                "hearings": hearings_result.data or []
+                "hearings": hearings
             }
         }
-
     except Exception as e:
         print(f"Calendar error: {e}")
         return {"found": False, "error": str(e)}
