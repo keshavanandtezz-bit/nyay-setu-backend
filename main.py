@@ -8,6 +8,7 @@ load_dotenv()
 from routes.citizen import router as citizen_router
 from routes.legal import router as legal_router
 from routes.ai import router as ai_router
+from routes.case import router as case_router
 
 app = FastAPI(
     title="Nyay Setu API",
@@ -33,6 +34,7 @@ app.add_middleware(
 app.include_router(citizen_router)
 app.include_router(legal_router)
 app.include_router(ai_router)
+app.include_router(case_router)
 
 
 @app.get("/")
