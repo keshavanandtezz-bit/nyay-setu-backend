@@ -2,18 +2,15 @@
 Case API routes — handles complaint filing, case lookup, and stage tracking.
 Uses MongoDB Atlas for persistence.
 """
-import os
 import uuid
-from datetime import datetime, date
+from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional, List
-from db.mongo_client import db
+from db.mongo_client import cases_col
+
 
 router = APIRouter(prefix="/case", tags=["case"])
-
-# Collection for filed complaints / cases
-cases_col = db["cases"]
 
 
 def clean(doc: dict) -> dict:
@@ -21,6 +18,10 @@ def clean(doc: dict) -> dict:
     if doc:
         doc.pop("_id", None)
     return doc
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 # ── Pydantic models ──────────────────────────────────────────────────────────
@@ -38,6 +39,7 @@ class ComplaintData(BaseModel):
     evidence_description: Optional[str] = ""
     ai_summary: Optional[str] = ""
     suggested_ipc: Optional[List] = []
+    police_station: Optional[str] = ""
 
 
 class StageUpdate(BaseModel):
@@ -57,8 +59,7 @@ class DocumentMeta(BaseModel):
 async def file_complaint(data: ComplaintData):
     """File a new complaint and store it in MongoDB."""
     try:
-        # Generate a unique case ID in format NS-YYYY-XXXXXX
-        year = datetime.now().year
+        year = datetime.now(timezone.utc).year
         unique_part = str(uuid.uuid4()).upper()[:6]
         case_id = f"NS-{year}-{unique_part}"
 
@@ -66,8 +67,8 @@ async def file_complaint(data: ComplaintData):
             "case_id": case_id,
             "status": "Registered",
             "stage": "complaint_filed",
-            "filed_at": datetime.utcnow().isoformat(),
-            "last_updated": datetime.utcnow().isoformat(),
+            "filed_at": now_iso(),
+            "last_updated": now_iso(),
             "description": data.description,
             "category": data.category,
             "incident_date": data.incident_date,
@@ -80,12 +81,13 @@ async def file_complaint(data: ComplaintData):
             "evidence_description": data.evidence_description or "",
             "ai_summary": data.ai_summary or "",
             "suggested_ipc": data.suggested_ipc or [],
+            "police_station": data.police_station or "",
             "documents": [],
             "stage_history": [
                 {
                     "stage": "complaint_filed",
                     "label": "Complaint Filed",
-                    "completed_at": datetime.utcnow().isoformat(),
+                    "completed_at": now_iso(),
                     "notes": "Complaint successfully registered via Nyay Setu."
                 }
             ]
@@ -106,17 +108,7 @@ async def file_complaint(data: ComplaintData):
         raise HTTPException(status_code=500, detail=f"Failed to file complaint: {str(e)}")
 
 
-@router.get("/{case_id}")
-async def get_case(case_id: str):
-    """Fetch a case by its case ID."""
-    try:
-        doc = cases_col.find_one({"case_id": case_id.upper()})
-        if not doc:
-            return {"found": False, "message": f"No case found with ID: {case_id}"}
-        return {"found": True, "case": clean(doc)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
+# ── Fixed routes: search and analytics MUST come BEFORE /{case_id} ────────────
 
 @router.get("/search")
 async def search_cases(phone: str = "", name: str = ""):
@@ -138,6 +130,51 @@ async def search_cases(phone: str = "", name: str = ""):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/analytics")
+async def get_analytics():
+    """Basic analytics across all filed cases."""
+    try:
+        total = cases_col.count_documents({})
+        by_category = list(cases_col.aggregate([
+            {"$group": {"_id": "$category", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}},
+            {"$limit": 10}
+        ]))
+        by_district = list(cases_col.aggregate([
+            {"$group": {"_id": "$district", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}},
+            {"$limit": 10}
+        ]))
+        by_stage = list(cases_col.aggregate([
+            {"$group": {"_id": "$stage", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}}
+        ]))
+        return {
+            "total_cases": total,
+            "by_category": [{"category": x["_id"], "count": x["count"]} for x in by_category],
+            "by_district": [{"district": x["_id"], "count": x["count"]} for x in by_district],
+            "by_stage": [{"stage": x["_id"], "count": x["count"]} for x in by_stage],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Variable path route MUST be last ─────────────────────────────────────────
+
+@router.get("/{case_id}")
+async def get_case(case_id: str):
+    """Fetch a case by its case ID."""
+    try:
+        doc = cases_col.find_one({"case_id": case_id.upper()})
+        if not doc:
+            raise HTTPException(status_code=404, detail=f"No case found with ID: {case_id}")
+        return {"found": True, "case": clean(doc)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.put("/{case_id}/stage")
 async def update_stage(case_id: str, body: StageUpdate):
     """Update the current stage of a case."""
@@ -150,7 +187,7 @@ async def update_stage(case_id: str, body: StageUpdate):
         stage_entry = {
             "stage": body.stage,
             "label": body.stage.replace("_", " ").title(),
-            "completed_at": datetime.utcnow().isoformat(),
+            "completed_at": now_iso(),
             "notes": body.notes or ""
         }
 
@@ -159,7 +196,7 @@ async def update_stage(case_id: str, body: StageUpdate):
             {
                 "$set": {
                     "stage": body.stage,
-                    "last_updated": datetime.utcnow().isoformat()
+                    "last_updated": now_iso()
                 },
                 "$push": {"stage_history": stage_entry}
             }
@@ -181,7 +218,7 @@ async def add_document(case_id: str, meta: DocumentMeta):
             "filename": meta.filename,
             "type": meta.type,
             "description": meta.description or "",
-            "uploaded_at": datetime.utcnow().isoformat()
+            "uploaded_at": now_iso()
         }
         result = cases_col.update_one(
             {"case_id": case_id},
@@ -207,29 +244,5 @@ async def get_documents(case_id: str):
         return {"case_id": case_id.upper(), "documents": doc.get("documents", [])}
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/analytics")
-async def get_analytics():
-    """Basic analytics across all filed cases."""
-    try:
-        total = cases_col.count_documents({})
-        by_category = list(cases_col.aggregate([
-            {"$group": {"_id": "$category", "count": {"$sum": 1}}},
-            {"$sort": {"count": -1}},
-            {"$limit": 10}
-        ]))
-        by_district = list(cases_col.aggregate([
-            {"$group": {"_id": "$district", "count": {"$sum": 1}}},
-            {"$sort": {"count": -1}},
-            {"$limit": 10}
-        ]))
-        return {
-            "total_cases": total,
-            "by_category": [{"category": x["_id"], "count": x["count"]} for x in by_category],
-            "by_district": [{"district": x["_id"], "count": x["count"]} for x in by_district]
-        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

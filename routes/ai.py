@@ -1,25 +1,27 @@
 import os
 import json
+import tempfile
+from datetime import date
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from pydantic import BaseModel
 from groq import Groq
 from dotenv import load_dotenv
 import pdfplumber
-import tempfile
 
 load_dotenv()
 
 router = APIRouter(prefix="/ai", tags=["ai"])
 
 GROQ_KEY = os.getenv("GROQ_API_KEY", "")
-MODEL = "llama-3.3-70b-versatile"
+MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+MAX_PDF_SIZE_MB = 10
 
 
 def get_groq_client():
     if not GROQ_KEY:
         raise HTTPException(
             status_code=500,
-            detail="GROQ_API_KEY not set in environment variables"
+            detail="AI service is not configured. Please contact support."
         )
     return Groq(api_key=GROQ_KEY)
 
@@ -44,20 +46,6 @@ class BailRequest(BaseModel):
     lawyer: str
 
 
-@router.get("/check-key")
-async def check_key():
-    """Check if Groq key is configured correctly"""
-    if not GROQ_KEY:
-        return {"status": "error", "message": "GROQ_API_KEY not set"}
-    if len(GROQ_KEY) < 20:
-        return {"status": "error", "message": "GROQ_API_KEY looks invalid (too short)"}
-    return {
-        "status": "ok",
-        "key_prefix": GROQ_KEY[:8] + "...",
-        "key_length": len(GROQ_KEY)
-    }
-
-
 @router.post("/rights-bot")
 async def rights_bot(payload: ChatMessage):
     try:
@@ -74,7 +62,7 @@ async def rights_bot(payload: ChatMessage):
 
         messages = [{"role": "system", "content": system}]
         for m in payload.messages:
-            if isinstance(m, dict):
+            if isinstance(m, dict) and "role" in m and "content" in m:
                 messages.append(m)
 
         response = client.chat.completions.create(
@@ -86,19 +74,25 @@ async def rights_bot(payload: ChatMessage):
         reply = response.choices[0].message.content
         return {"reply": reply}
 
+    except HTTPException:
+        raise
     except Exception as e:
         error_msg = str(e)
         print(f"RightsBot error: {error_msg}")
-        raise HTTPException(status_code=500, detail=error_msg)
+        raise HTTPException(status_code=500, detail="AI service is temporarily unavailable. Please try again.")
 
 
 @router.post("/analyze-case")
 async def analyze_case(file: UploadFile = File(...)):
-    if not file.filename.endswith(".pdf"):
+    if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files accepted")
 
+    content = await file.read()
+    if len(content) > MAX_PDF_SIZE_MB * 1024 * 1024:
+        raise HTTPException(status_code=400, detail=f"File too large. Maximum size is {MAX_PDF_SIZE_MB}MB.")
+
+    tmp_path = None
     try:
-        content = await file.read()
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(content)
             tmp_path = tmp.name
@@ -113,7 +107,7 @@ async def analyze_case(file: UploadFile = File(...)):
         if not full_text.strip():
             raise HTTPException(
                 status_code=400,
-                detail="PDF appears scanned. Please use a searchable PDF."
+                detail="PDF appears to be scanned (image-based). Please use a text-searchable PDF."
             )
 
         words = full_text.split()[:3500]
@@ -125,6 +119,12 @@ async def analyze_case(file: UploadFile = File(...)):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 
 @router.post("/analyze-text")
@@ -169,15 +169,34 @@ async def _analyze_text_internal(case_text: str) -> dict:
         ]
     )
     raw = response.choices[0].message.content
-    clean = raw.replace("```json", "").replace("```", "").strip()
-    return json.loads(clean)
+    cleaned = raw.replace("```json", "").replace("```", "").strip()
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        # Fallback: return a safe empty structure if LLM returns invalid JSON
+        return {
+            "case_title": "Analysis Complete",
+            "case_number": "",
+            "court": "",
+            "judge": "",
+            "accused": [],
+            "charges": [],
+            "ipc_sections": [],
+            "bail_status": "Unknown",
+            "current_status": "See summary below",
+            "key_facts": [],
+            "important_dates": [],
+            "summary": cleaned[:1000] if cleaned else "Could not parse structured analysis.",
+            "next_hearing": "",
+            "witnesses_total": 0,
+            "witnesses_examined": 0
+        }
 
 
 @router.post("/generate-bail")
 async def generate_bail_application(payload: BailRequest):
     try:
         client = get_groq_client()
-        from datetime import date
         today = date.today().strftime("%d %B %Y")
 
         response = client.chat.completions.create(
@@ -219,7 +238,9 @@ async def generate_bail_application(payload: BailRequest):
         )
         return {"success": True, "application": response.choices[0].message.content}
 
+    except HTTPException:
+        raise
     except Exception as e:
         error_msg = str(e)
         print(f"Bail generation error: {error_msg}")
-        raise HTTPException(status_code=500, detail=error_msg)
+        raise HTTPException(status_code=500, detail="AI service is temporarily unavailable. Please try again.")
