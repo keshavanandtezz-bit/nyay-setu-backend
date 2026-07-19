@@ -17,22 +17,15 @@ app = FastAPI(
     version="2.0.0"
 )
 
-# CORS — allow specific origins only
-ALLOWED_ORIGINS = [
-    "https://nyay-setu-kohl.vercel.app",
-    "https://nyay-setu.vercel.app",
-    "https://nyay-setu-beta.vercel.app",
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-]
-
+# CORS — allow all origins during beta (restrict after auth is added)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 
 # Register all routers
